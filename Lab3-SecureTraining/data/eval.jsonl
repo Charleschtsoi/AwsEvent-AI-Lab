@@ -1,0 +1,5 @@
+{"q": "What does Pod Security 'restricted' enforce?", "must_include": ["non-root"]}
+{"q": "Why pin container images by digest?", "must_include": ["digest"]}
+{"q": "Why is pickle dangerous for model files?", "must_include": ["code"]}
+{"q": "What is QLoRA?", "must_include": ["4-bit", "adapter"]}
+{"q": "What does Falco do?", "must_include": ["ebpf"]}
