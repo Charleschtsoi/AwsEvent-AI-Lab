@@ -1,0 +1,52 @@
+# Lab 3 · step 15 — hardened model server. Replaces the Ollama Deployment from AIApp/ai-app.yaml.
+# The fine-tuned model is mounted READ-ONLY from the signed OCI artifact (image volume, needs the
+# ImageVolume feature on your K8s version) and verified by the model-validation operator before start.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: ai-stack
+  labels: {app: ollama}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ollama}
+  template:
+    metadata:
+      labels:
+        app: ollama
+        validation.ml.sigstore.dev/ml: qwen3-ft      # opt in to signature verification
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: ollama
+        image: ollama/ollama@sha256:REPLACE_WITH_DIGEST   # pin by digest, never :latest
+        env:
+        - {name: HOME, value: /home/ollama}
+        - {name: OLLAMA_MODELS, value: /home/ollama/.ollama/models}
+        ports:
+        - {containerPort: 11434, name: api}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: {drop: ["ALL"]}
+        resources:
+          requests: {cpu: "1", memory: 2Gi}
+          limits: {cpu: "2", memory: 4Gi}
+        volumeMounts:
+        - {name: model, mountPath: /models/qwen3-ft, readOnly: true}   # signed weights + model.sig
+        - {name: ollama-home, mountPath: /home/ollama}                 # writable cache only
+      volumes:
+      - name: model
+        image:
+          reference: ghcr.io/billhoph/models/qwen3-ft@sha256:REPLACE_WITH_DIGEST
+          pullPolicy: IfNotPresent
+      - name: ollama-home
+        emptyDir: {sizeLimit: 8Gi}
+# After start:  kubectl exec deploy/ollama -n ai-stack -- ollama create qwen3-ft -f /models/qwen3-ft/Modelfile

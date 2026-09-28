@@ -1,0 +1,36 @@
+# Lab 3 · step 15 — model-specific Falco rules.
+# helm upgrade --install falco falcosecurity/falco -n falco --create-namespace \
+#   --set driver.kind=modern_ebpf --set tty=true -f runtime/falco-values.yaml
+# Validate first:  falco --validate <rules file>  (field names can differ between Falco versions)
+customRules:
+  ai-model-rules.yaml: |-
+    - list: model_server_procs
+      items: [ollama, ollama_llama_server, llama-server, python3]
+
+    - rule: Model weights read by unexpected process
+      desc: Something other than the model server opened the fine-tuned weights (possible theft)
+      condition: >
+        open_read and container and fd.name startswith /models/
+        and not proc.name in (model_server_procs)
+      output: >
+        Model file read by unexpected process (proc=%proc.name cmd=%proc.cmdline file=%fd.name
+        pod=%k8s.pod.name ns=%k8s.ns.name image=%container.image.repository)
+      priority: CRITICAL
+      tags: [ai, model, exfiltration]
+
+    - rule: Model server outbound connection
+      desc: The model server should never initiate outbound connections
+      condition: >
+        outbound and container and k8s.ns.name = ai-stack and container.name = ollama
+      output: >
+        Outbound connection from model server (dest=%fd.name proc=%proc.name pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [ai, model, egress]
+
+    - rule: Shell in model server
+      desc: Interactive shell spawned inside the model server container
+      condition: >
+        spawned_process and container and container.name = ollama and proc.name in (shell_binaries)
+      output: Shell in model server (cmd=%proc.cmdline pod=%k8s.pod.name user=%user.name)
+      priority: WARNING
+      tags: [ai, model, shell]

@@ -1,0 +1,48 @@
+# Lab 2 step 10 + Lab 3 step 15 — only the AI gateway may reach the model server; the model server has no egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny-all, namespace: ai-stack}
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: ollama-from-gateway-only, namespace: ai-stack}
+spec:
+  podSelector: {matchLabels: {app: ollama}}
+  policyTypes: ["Ingress"]
+  ingress:
+  - from: [{podSelector: {matchLabels: {app: portkey-gateway}}}]
+    ports: [{port: 11434, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: gateway-from-webui, namespace: ai-stack}
+spec:
+  podSelector: {matchLabels: {app: portkey-gateway}}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+  - from: [{podSelector: {matchLabels: {app: open-webui}}}]
+    ports: [{port: 8787, protocol: TCP}]
+  egress:
+  - to: [{podSelector: {matchLabels: {app: ollama}}}]
+    ports: [{port: 11434, protocol: TCP}]
+  - to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+    ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: webui-ingress-egress, namespace: ai-stack}
+spec:
+  podSelector: {matchLabels: {app: open-webui}}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+  - ports: [{port: 8080, protocol: TCP}]
+  egress:
+  - to: [{podSelector: {matchLabels: {app: portkey-gateway}}}]
+    ports: [{port: 8787, protocol: TCP}]
+  - to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+    ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+# Point Open WebUI at the gateway, not at Ollama:  OLLAMA_BASE_URL=http://portkey-service.ai-stack.svc:8787
+# Note: kind's default CNI (kindnet) does not enforce NetworkPolicy — install Calico or Cilium for this lab.
