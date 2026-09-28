@@ -1,0 +1,14 @@
+# Lab 3 — secure training pipeline. Pin exact versions (and hashes) in your own lockfile:
+#   pip-compile --generate-hashes requirements.txt -o requirements.lock
+# Scanning / gates (CPU, any laptop)
+modelscan==0.8.5
+huggingface_hub>=0.34
+rapidfuzz>=3.9
+presidio-analyzer>=2.2
+presidio-anonymizer>=2.2
+garak
+model-signing>=1.1
+cyclonedx-bom>=7.0
+requests>=2.32
+# Training (GPU: Colab T4 / 8 GB+ NVIDIA). Install separately on the GPU box:
+#   pip install -r requirements-train.txt

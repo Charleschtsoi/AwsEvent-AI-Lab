@@ -1,0 +1,5 @@
+# Training on a GPU runner / Colab. Follow https://unsloth.ai/docs for the matching torch/CUDA build.
+unsloth
+unsloth_zoo
+trl
+datasets
