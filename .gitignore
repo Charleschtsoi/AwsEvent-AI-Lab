@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*-env/
+# Lab outputs — never commit models, datasets outputs or reports
+Lab3-SecureTraining/base/
+Lab3-SecureTraining/out/
+Lab3-SecureTraining/reports/
+Lab3-SecureTraining/data/redacted.jsonl
+Lab3-SecureTraining/data/clean.jsonl
+Lab3-SecureTraining/data/quarantine.jsonl
+*.sha256
+*.sig
+*.cdx.json
+garak_runs/
+# keys
+cosign.key
+*.pem
+.DS_Store

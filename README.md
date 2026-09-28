@@ -1,342 +1,232 @@
-# AI on K8S — Security Considerations Lab Guide
+# AI on Kubernetes — Supply Chain Security & Defense-in-Depth Lab
 
-**Author:** Bill Ho  
-**Date:** 29 May 2026  
-**Certifications:** CKA / CKAD / CKS / CAISP
+**Author:** Bill Ho · CKA / CKAD / CKS / CAISP / AIGP / CIPM
+**Edition:** 2026, updated for Kubernetes v1.37
+**Slides:** [`AI_on_K8S_Supply_Chain_Security.pdf`](AI_on_K8S_Supply_Chain_Security.pdf) (70 slides)
 
----
+This lab goes with the talk *AI on Kubernetes: supply chain security & defense-in-depth for cloud-native AI*. It has **3 labs and 15 hands-on steps**. You start with a cluster, add a guarded LLM, and finish with a securely fine-tuned model that is signed, verified and protected at runtime.
 
-## Overview
-
-This lab walks through the key security considerations when running AI workloads on Kubernetes. It covers cluster hardening, runtime protection, image scanning, IaC scanning, and AI-specific security tooling.
-
----
-
-## Why Run AI on Kubernetes?
-
-Kubernetes provides four core benefits for AI workloads:
-
-| Benefit | Description |
-|---|---|
-| **Elasticity** | Scale AI workloads up or down automatically based on demand — no over-provisioning GPUs during idle periods or starving jobs at peak load |
-| **Simplicity** | Abstracts infrastructure complexity; data scientists deploy and manage AI workloads through a single unified control plane |
-| **Freedom of Choice** | Run any AI framework or runtime (PyTorch, TensorFlow, vLLM, Ollama) on any cloud or on-prem infrastructure without vendor lock-in |
-| **Security** | Enforce fine-grained access controls, network policies, and secrets management across all AI workloads |
-
-### Common AI Workloads on K8S
-
-- **Inference runtimes:** vLLM, Ollama
-- **Training/orchestration:** Kubeflow, KServe
-- **Vector databases:** Milvus
-- **Data stores:** PostgreSQL, MongoDB, Elasticsearch
-- **Platforms:** Red Hat OpenShift AI, SUSE Rancher
-
-### Logical Architecture
-
-```
-API/MCP Gateway (LiteLLM) → AI Apps → Vector DB (Milvus) → AI Runtime (vLLM)
-                                ↕
-              AI Infra Management — Optional (KServe)
-              AI Monitoring: TTFT, TPOT, TPS, Latency
-                        K8S
-```
+| Deck section | Covered in this repo |
+| --- | --- |
+| 01 Why AI on Kubernetes | Reference architecture (below) |
+| 02 Why security first | 2025–26 incidents: LiteLLM / TeamPCP, NVIDIAScape, tj-actions, ingress-nginx EOL |
+| 03 Supply chain security 101 | The expanding supply chain — DevSecOps vs ModelOps (slides 17–26), then SBOM · signing · provenance · VEX · policy |
+| 04 Securing the K8s platform | **Lab 1** (steps 1–6) + [`devsecops-app.yml`](.github/workflows/devsecops-app.yml) |
+| 05 Securing the AI stack | **Lab 2** (steps 7–10) |
+| 06 Secure model training pipeline | **Lab 3** (steps 11–15) + [`secure-model-pipeline.yml`](.github/workflows/secure-model-pipeline.yml) |
+| 07 Putting it together | Secured reference architecture & action plan (below) |
 
 ---
 
-## K8S Security Fundamentals
+## Prerequisites
 
-### Security Domains
-
-**Static Risk (design-time)**
-- Configuration & YAML design
-- K8S cluster setup
-- Admission control
-- Code & libraries
-- Compliance
-- TLS / mTLS
-
-**Runtime / Dynamic Risk (run-time)**
-- Runtime sandbox
-- Privileged pod detection
-- Network policy enforcement
-- Abnormal action detection
-- Backup & recovery
-
-### K8S Security Tooling Layers
-
-| Layer | Tooling Category | Example Tools |
-|---|---|---|
-| Code Repo | SCA | Syft, Checkov |
-| Build Pipeline | SAST / DAST | Trivy, Snyk |
-| Image Pipeline | Image Scan | Grype, Kyverno, Clair |
-| ArgoCD Pipeline | IaC Scan | Checkov |
-| Perimeter | DDoS / NGFW / WAF | — |
-| K8S Runtime | KSPM | Kube-bench, Kube-hunter |
-| K8S Runtime | CWPP | Aqua |
-| K8S Runtime | XDR | Falco, CrowdStrike |
-| Storage | Data Protection | Veeam Kasten K10 |
-
-### Operation-wise Security Practices
-
-- **DevSecOps / GitOps / IaC** — shift security left into the pipeline
-- **Dependency Scan** — SBOM, SCA
-- **Code Scan** — SAST
-- **Secure Image Packaging**
-- **Dynamic Scan** — DAST
-- **Immutable Infrastructure**
-
----
-
-## Lab 1 — KIND Cluster Setup (Playground)
+Docker Desktop · `kind` · `kubectl` · `helm` · Python 3.10–3.12 · Ollama (optional)
+Lab 3 training needs an NVIDIA GPU (a free Colab T4 or an 8 GB+ laptop GPU is enough for Qwen3-1.7B QLoRA). Every scan and gate step runs on CPU.
 
 ```bash
-brew install kind
+brew install kind kubectl helm checkov syft grype cosign trufflehog
+```
+
+> **Note:** kind's default CNI does not enforce NetworkPolicy. For the NetworkPolicy steps, create the cluster with `disableDefaultCNI: true` and install Calico or Cilium.
+
+---
+
+## Repository layout
+
+```
+.github/workflows/
+  devsecops-app.yml          # slides 34–35: app DevSecOps as a workflow (7 required jobs)
+  secure-model-pipeline.yml  # slides 56–57: model pipeline as a workflow (8 jobs + runtime)
+Lab1-Platform/kyverno/       # step 5: verify-image policies (key-based + keyless)
+AIApp/                       # step 10: Open WebUI + Ollama, Portkey AI gateway
+ModelScan/                   # step 7: benign vs trojanized Keras models
+LLMRedteam/                  # step 8: garak notes
+SASTTest/  SCATest/          # SAST (Bandit/Semgrep) and SCA (Grype/Syft) samples
+LLMChatbot/                  # sample app (+ Dockerfile) built by devsecops-app.yml
+Lab3-SecureTraining/         # steps 11–15: scripts, dataset, K8s manifests, runtime hardening
+```
+
+---
+
+## The two pipelines: shift left, shield right
+
+Both pipelines have the same shape. A **concept slide** shows the stages, and a **workflow slide** shows the same stages as GitHub Actions jobs. Every job is a required status check: a red ✗ stops the run.
+
+| DevSecOps (app) — slide 34 → 35 | MLSecOps (model) — slide 56 → 57 |
+| --- | --- |
+| IDE → `pre-commit` | Data → `scan-dataset` |
+| Code repo → `sast-secrets` · `sca-iac` | Base model → `pin-inputs` · `scan-model` |
+| CI build → `build-image` | Train → `train-qlora` |
+| Registry → `scan-image` | Evaluate → `scan-output` · `red-team-eval` |
+| — → `sign-attest` | Registry → `sign-attest` |
+| GitOps / Admission → `deploy-gitops` | Admission → `publish-admit` |
+| Runtime → `runtime-shield` (in cluster) | Runtime → `runtime-protect` (in cluster) |
+
+**Roll it out in phases.** Set `ENFORCE` in `devsecops-app.yml`:
+
+1. **Crawl (weeks 1–2):** every job runs in audit mode (`ENFORCE: "false"`). Build a baseline and pin actions and scanners by SHA.
+2. **Walk (months 1–2):** block leaked secrets and fixable criticals on PRs, and SBOM + sign every image.
+3. **Run (this quarter):** set `ENFORCE: "true"` and switch Kyverno to `Enforce`. Runtime alerts go to on-call.
+
+**Hardening already built into the workflows:**
+
+- Every third-party action is pinned by commit SHA (tj-actions and TeamPCP are the reason).
+- Signing is keyless OIDC, so there are no long-lived keys to steal.
+- `persist-credentials: false` on every checkout.
+- Token permissions are least-privilege per job.
+- `environment: production` gates deploy/publish behind a required reviewer.
+
+**Before the first run:**
+
+- Create the `production` environment with a required reviewer.
+- Add repo variables `QWEN3_BASE_REV` (the Hugging Face commit SHA you reviewed), `ORAS_VERSION` and `ORAS_SHA256`.
+- Register an ephemeral self-hosted runner with the labels `gpu, ephemeral` for the training job.
+
+---
+
+## Lab 1 — Platform (steps 1–6)
+
+### Step 1 · kind cluster playground
+```bash
 kind create cluster --name kind-aws
-kubectl get pod -A
-kubectl get node
+kubectl get nodes && kubectl get pods -A
 ```
+All control-plane pods (etcd, kube-apiserver, scheduler, coredns) should be `Running`. kind is disposable, so it's safe to break. Don't benchmark production posture on it.
 
-> Verify that control plane components (coredns, etcd, kube-apiserver, kube-controller-manager, kube-scheduler) are all `Running`.
-
----
-
-## Lab 2 — Kube-Bench: K8S Cluster Config Scan
-
-Kube-bench checks Kubernetes deployments against the CIS Kubernetes Benchmark.
-
+### Step 2 · kube-bench — CIS benchmark
 ```bash
-git clone https://github.com/aquasecurity/kube-bench.git
-cd kube-bench
+git clone https://github.com/aquasecurity/kube-bench.git && cd kube-bench
 kubectl apply -f job.yaml
-kubectl get pods
-kubectl logs <kube-bench-pod-name>
+kubectl logs job/kube-bench
 ```
+Review the PASS / FAIL / WARN summary, `1.1.x` file permissions and `5.x` policies. Example fix: `seccompProfile: {type: RuntimeDefault}`. On EKS/AKS/GKE use the matching `job-eks.yaml` etc.
 
-**Interpreting results:**
-
-```
-== Summary total ==
-63 checks PASS
-12 checks FAIL
-56 checks WARN
-0  checks INFO
-```
-
-Key checks to review:
-- `1.1.x` — Control Plane Node Configuration Files (file permissions and ownership)
-- `5.6.x` — Namespace segregation, SecurityContext, seccomp profiles
-
-**Example remediation (seccomp):**
-```yaml
-securityContext:
-  seccompProfile:
-    type: RuntimeDefault
-```
-
----
-
-## Lab 3 — Falco: Runtime Protection
-
-Falco uses eBPF to detect anomalous behaviour in running containers.
-
+### Step 3 · Checkov — IaC, manifests & Helm
 ```bash
-brew install helm
-
-# Add the Falco Helm repo
-helm repo add falcosecurity https://falcosecurity.github.io/charts
-helm repo update
-
-# Install Falco with modern eBPF driver
-helm install falco falcosecurity/falco \
-  --namespace falco \
-  --create-namespace \
-  --set tty=true \
-  --set driver.kind=modern_ebpf
+checkov -d . --framework kubernetes,dockerfile
 ```
+Watch for `CKV_K8S_*` (privileged, runAsRoot, no limits), `CKV_DOCKER_3` (no non-root USER) and `CKV_DOCKER_7` (`latest` tag). Fail the PR on HIGH.
 
-**Verify installation:**
+### Step 4 · Syft + Grype — SBOM first, then CVEs
 ```bash
-kubectl get all -n falco
-kubectl logs <falco-pod-name> -f -n falco
-```
-
-Falco will load rules from `/etc/falco/falco_rules.yaml` and begin monitoring container runtime events.
-
----
-
-## Lab 4 — Checkov: IaC and YAML Scanning
-
-Checkov statically analyses Kubernetes manifests, Dockerfiles, and Helm charts for misconfigurations.
-
-```bash
-brew install checkov
-checkov -d .
-```
-
-**Sample output:**
-```
-kubernetes scan results:
-Passed checks: 1023, Failed checks: 270, Skipped checks: 0
-
-Check: CKV_K8S_80: "Ensure admission control plugin AlwaysPullImages is set"
-  PASSED for resource: Job.default.kube-bench
-```
-
-**Common failures to watch for:**
-- `CKV_DOCKER_2` — No HEALTHCHECK in container image
-- `CKV_DOCKER_3` — No dedicated user for the container
-- `CKV_DOCKER_7` — Base image uses `latest` tag
-
----
-
-## Lab 5 — Grype: Container Image Scanning
-
-Grype scans container images for known CVEs.
-
-```bash
-brew install grype
 docker pull nginx
-grype nginx
+syft nginx -o cyclonedx-json > nginx.cdx.json
+grype sbom:nginx.cdx.json --only-fixed      # re-scan the SBOM daily; no need to re-pull
 ```
+Patch what has a fix. For "won't fix", add a VEX statement or a compensating control. Pin scanner versions: a scanner is privileged supply-chain code.
 
-**Sample output columns:**
-
-| NAME | INSTALLED | FIX-IN | TYPE | VULNERABILITY | SEVERITY |
-|---|---|---|---|---|---|
-| perl-base | 5.40.1-6 | — | deb | CVE-2026-42497 | High |
-| curl | 8.14.1-2+deb13u3 | (won't fix) | deb | CVE-2026-3784 | Medium |
-
-Review High and Critical CVEs and determine remediation (patch, pin version, or accept risk).
-
----
-
-## Lab 6 — AI-Specific Security
-
-### AI vs Cloud Native App Security Comparison
-
-| Security Check | Cloud Native App | AI Workload |
-|---|---|---|
-| SCA | ✅ | ✅ |
-| DAST | ✅ | — |
-| Backdoor Scan | — | ✅ |
-| Image Scan | ✅ | ✅ |
-| Model Scan | — | ✅ |
-| SAST | ✅ | ✅ |
-| Dataset Scan | — | ✅ |
-| KSPM | ✅ | ✅ |
-| XDR | ✅ | ✅ |
-
-### AI Security Considerations
-
-- Data Preparation & Feature Extraction
-- Training pipeline security
-- Model integrity & access control
-- Inferencing security
-- RAG (Retrieval-Augmented Generation) attack surface
-- Agentic AI risks
-- Supply Chain Management — **AIBOM** (AI Bill of Materials)
-
-### Relevant Tools
-
-- **Identity/Access:** Keycloak, JSON Web Tokens, StackLok, Permify, SpiceDB
-- **Runtime Protection / AISPM:** Various OWASP GenAI landscape tools
-- **AI Redteaming / Fuzzing**
-- **LLM Guardrails**
-- **Data Security Posture Management (DSPM)**
-
----
-
-## Lab 6a — ProtectAI ModelScan
-
+### Step 5 · Sign with cosign, enforce with Kyverno (bonus)
 ```bash
-# Install Python 3.12
-brew install python@3.12
-
-# Create a virtual environment
-python3.12 -m venv .venv
-
-# Activate and install modelscan
-source .venv/bin/activate
-pip install modelscan
+IMG=ttl.sh/demo-$RANDOM:1h
+docker tag nginx $IMG && docker push $IMG
+cosign generate-key-pair && cosign sign --key cosign.key $IMG && cosign verify --key cosign.pub $IMG
+helm repo add kyverno https://kyverno.github.io/kyverno/
+helm install kyverno kyverno/kyverno -n kyverno --create-namespace
+kubectl apply -f Lab1-Platform/kyverno/verify-image.yaml   # paste cosign.pub first
 ```
+Unsigned `ttl.sh/*` images are denied, and signed images are admitted and rewritten to a digest. For production, use [`verify-image-keyless.yaml`](Lab1-Platform/kyverno/verify-image-keyless.yaml), which trusts images signed by this repo's workflow.
 
-Use modelscan to inspect serialised model files (e.g. `.pkl`, `.pt`) for embedded malicious code.
+### Step 6 · Falco — eBPF runtime detection
+```bash
+helm repo add falcosecurity https://falcosecurity.github.io/charts && helm repo update
+helm install falco falcosecurity/falco -n falco --create-namespace --set tty=true --set driver.kind=modern_ebpf
+kubectl run web --image=nginx && kubectl exec -it web -- sh -c 'cat /etc/shadow'
+kubectl logs -n falco -l app.kubernetes.io/name=falco -c falco
+```
+You should see "Terminal shell in container" and "Read sensitive file untrusted". Forward alerts with Falcosidekick to your SIEM or Slack.
 
 ---
 
-## Lab 6b — FuzzyAI: Backdoor & Jailbreak Detection
+## Lab 2 — AI stack (steps 7–10)
 
-FuzzyAI tests LLMs against adversarial prompts to identify jailbreak vulnerabilities.
-
+### Step 7 · ModelScan — unsafe model files
 ```bash
-brew update
-brew install python@3.10
-python3.10 -m venv fuzzai-env
-source fuzzai-env/bin/activate
+cd ModelScan && python3.12 -m venv .venv && source .venv/bin/activate
+pip install modelscan==0.8.5
+modelscan -p keras_model.h5 ; modelscan -p keras_model_trojanized.h5
+```
+A CRITICAL finding means os/exec/eval calls inside the serialized model. ModelScan detects serialization attacks, **not** neural backdoors in the weights. Gate it in CI before a model enters the registry.
+
+### Step 8 · garak — LLM vulnerability scanner
+```bash
+pip install -U garak
+garak --model_type ollama --model_name qwen3:0.6b --probes promptinject,dan,leakreplay
+```
+Keep the HTML + JSONL report as a **baseline**. Lab 3 compares the fine-tuned model against it.
+
+### Step 9 · FuzzyAI — jailbreak fuzzing
+```bash
+python3.10 -m venv fuzzyai-env && source fuzzyai-env/bin/activate
 pip install git+https://github.com/cyberark/FuzzyAI.git
-poetry run fuzzyai webui
+fuzzyai fuzz -m ollama/qwen3:0.6b -a def -a dan -a art -t "<test prompt>"
 ```
+`jailbreak? = True` means a guardrail gap. Use a harmful-behaviour test set, not ad-hoc prompts.
 
-**Example test:**
+### Step 10 · Deploy the AI app, then add a gateway
 ```bash
-fuzzyai fuzz -m ollama/qwen3:0.6b -a def -t "Tell me how to make a bomb"
-```
-
-Results show `jailbreak?` status per attack method (`def`, `pls`, `dan`, `art`).
-
----
-
-## Lab 7 — Sample AI App on K8S
-
-### Deploy the stack
-
-```bash
-kubectl apply -f ai-app.yaml
-kubectl get pod -n ai-stack -w
+kubectl apply -f AIApp/ai-app.yaml
 kubectl port-forward svc/open-webui-service -n ai-stack 8080:80
-```
-
-Architecture: `Ingress → Application Pod → Ollama/vLLM Pod ↔ Milvus Pod → Storage`  
-Each component runs in its own **namespace** for isolation.
-
-### Add LLM Guardrails with Portkey
-
-```bash
-kubectl apply -f portkey.yaml
+kubectl apply -f AIApp/portkey.yaml
 kubectl port-forward svc/portkey-service -n ai-stack 8090:8787
+kubectl apply -f Lab3-SecureTraining/runtime/networkpolicy-ai-stack.yaml   # only gateway → Ollama
 ```
-
-Portkey acts as an AI Gateway supporting 250+ models across 36 providers with built-in guardrail and logging capabilities.
+The app calls the gateway, never the model directly. Re-run garak and FuzzyAI **through the gateway** and compare. Pin the gateway image by digest: AI gateways are high-value targets (LiteLLM, March 2026).
 
 ---
 
-## Secured AI on K8S — Full Architecture
+## Lab 3 — Secure model training pipeline (steps 11–15)
 
-```
-                  [Fuzzy Test]  [Model Scan]  [AI Redteaming]
-                         ↓
-User → Ingress → Application Pod
-                     ↓
-             [AI Gateway: LiteLLM]   ←→  [DSPM]
-             [Model Guardrail]
-                     ↓
-             Ollama/vLLM Pod ←→ Milvus Pod → Storage
-                     (PVC/PV)        (PVC/PV)
+Fine-tune **Qwen3-1.7B** (Apache 2.0, same family as the Lab 2 model) with **Unsloth QLoRA**, and gate every input and output. Full guide: [`Lab3-SecureTraining/README.md`](Lab3-SecureTraining/README.md).
 
-── K8S ──────────────────────────────────────────────────
-     [KSPM]   [CWPP]   [XDR]   [Kasten K10]
-```
+| Step | What | Files |
+| --- | --- | --- |
+| 11 | Pin & scan the inputs: base model (revision SHA, no pickle, ModelScan) and dataset (TruffleHog, Presidio PII, fuzzy scan) | `scripts/scan_inputs.sh`, `scan_pii.py`, `fuzzy_scan.py`, `triggers.txt` |
+| 12 | QLoRA fine-tune in a locked-down Job (offline, no egress, non-root, read-only data) | `scripts/train.py`, `k8s/train-job.yaml`, `k8s/namespace-training.yaml` |
+| 13 | Scan the output, red-team the result against the base baseline | `scripts/gate.py`, `data/eval.jsonl` |
+| 14 | Sign (OpenSSF Model Signing), AIBOM (CycloneDX ML-BOM), publish by digest, verify on admit | `scripts/make_aibom.py`, `k8s/model-validation.yaml` |
+| 15 | Harden the serving pod, then watch it | `runtime/ollama-deploy.yaml`, `runtime/falco-values.yaml`, `runtime/networkpolicy-ai-stack.yaml` |
+
+**Runtime: protect the model while it serves.**
+
+| Threat | Control |
+| --- | --- |
+| Prompt injection & jailbreak (OWASP LLM01) | Input/output guardrails at the AI gateway |
+| Model extraction & runaway cost (LLM10) | Per-app auth, rate limits, token quotas |
+| Weight theft | Zero-egress NetworkPolicy, no `kubectl exec`, RBAC on model storage, encryption at rest |
+| Tampering & model swap | Signed digest mounted read-only, re-verified every 10 minutes |
+| Runtime compromise | Falco / Tetragon model-specific rules |
+| Leakage & drift (LLM02) | Output PII redaction, logs → SIEM, behavioural baselines |
+| **Recover** | Immutable, off-cluster backups of model registry, vector DB & config (e.g. Veeam Kasten) |
 
 ---
 
-## References & Resources
+## Secured reference architecture
 
-- [OWASP GenAI Security Solutions Landscape](https://genai.owasp.org/ai-security-solutions-landscape/)
-- [CNCF Security & Compliance Landscape](https://landscape.cncf.io/card-mode?category=security-compliance)
-- [Kube-bench](https://github.com/aquasecurity/kube-bench)
-- [Falco](https://falco.org)
-- [Checkov](https://www.checkov.io)
-- [Grype](https://github.com/anchore/grype)
-- [FuzzyAI](https://github.com/cyberark/FuzzyAI)
-- [ProtectAI ModelScan](https://github.com/protectai/modelscan)
-- [Veeam Kasten K10](https://www.veeam.com/kubernetes-data-protection.html)
+```
+BUILD-TIME GATES   SBOM/AIBOM · sign images & models · model & data scan · LLM red teaming
+                   └──► Admission: verify signatures · Pod Security 'restricted'
+KUBERNETES (default-deny NetworkPolicy between namespaces)
+  User → Gateway API + WAF → App pod → AI gateway + guardrails → vLLM / Ollama
+                                            │                        │
+                          DSPM ┄┄► Milvus (vector DB)          PV (encrypted)
+PLATFORM CONTROLS  KSPM (kube-bench) · CWPP (Falco) · CDR/XDR (SIEM) · Identity (RBAC, agents) · Backup & DR (Kasten)
+```
+
+## What to do on Monday
+
+| This week | This quarter | This year |
+| --- | --- | --- |
+| Inventory NodePort / LoadBalancer services & ingress-nginx | SBOM + sign every image; verify at admission | SLSA build L2–L3 with provenance |
+| Pod Security `restricted` in warn mode everywhere | Falco / Tetragon → SIEM with on-call routing | AIBOM + model signing (OMS) with admission checks |
+| Run kube-bench + Checkov; pin CI actions & scanners by SHA | Scan every model before load; move to safetensors | Agent identity & least-privilege tool access (MCP) |
+| Patch NVIDIA Container Toolkit ≥ 1.17.8 on GPU nodes | AI gateway + guardrails in front of every LLM | Immutable backups + quarterly DR drills; CRA-ready reporting |
+
+---
+
+## References
+
+- Frameworks: [OWASP Top 10 for LLM Apps](https://genai.owasp.org/llm-top-10/) · [OWASP Agentic Top 10](https://genai.owasp.org/) · [MITRE ATLAS](https://atlas.mitre.org/) · [NIST AI RMF](https://www.nist.gov/itl/ai-risk-management-framework) · [SLSA](https://slsa.dev)
+- Platform: [kube-bench](https://github.com/aquasecurity/kube-bench) · [Checkov](https://www.checkov.io) · [Syft](https://github.com/anchore/syft) · [Grype](https://github.com/anchore/grype) · [cosign](https://github.com/sigstore/cosign) · [Kyverno](https://kyverno.io) · [Falco](https://falco.org)
+- AI: [ModelScan](https://github.com/protectai/modelscan) · [garak](https://github.com/NVIDIA/garak) · [FuzzyAI](https://github.com/cyberark/FuzzyAI) · [Portkey gateway](https://github.com/Portkey-AI/gateway) · [Unsloth](https://unsloth.ai/docs) · [OpenSSF Model Signing](https://github.com/sigstore/model-transparency) · [model-validation-operator](https://github.com/sigstore/model-validation-operator) · [Presidio](https://github.com/microsoft/presidio) · [TruffleHog](https://github.com/trufflesecurity/trufflehog)
+- Landscapes: [OWASP GenAI Security Solutions](https://genai.owasp.org/ai-security-solutions-landscape/) · [CNCF Security & Compliance](https://landscape.cncf.io/card-mode?category=security-compliance)
+- Data protection: [Veeam Kasten](https://www.veeam.com/kubernetes-data-protection.html)
