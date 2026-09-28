@@ -1,0 +1,47 @@
+# Lab 3 · step 12 — Unsloth QLoRA in a locked-down Job.
+# Pre-reqs: namespace-training.yaml applied; PVCs 'lab3-inputs' (base/ + data/clean.jsonl, verified in step 11)
+# and 'lab3-outputs'; an image you built from requirements-train.txt, pushed and referenced BY DIGEST.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train-qlora
+  namespace: training
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: {app: train-qlora}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: train
+        image: ghcr.io/billhoph/unsloth-train@sha256:REPLACE_WITH_DIGEST
+        command: ["python", "scripts/train.py", "--base", "/inputs/base", "--data", "/inputs/data/clean.jsonl", "--out", "/outputs", "--gguf"]
+        workingDir: /app
+        env:
+        - {name: HF_HUB_OFFLINE, value: "1"}
+        - {name: HF_DATASETS_OFFLINE, value: "1"}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: ["ALL"]}
+        resources:
+          limits: {nvidia.com/gpu: 1, memory: 16Gi}
+          requests: {cpu: "2", memory: 8Gi}
+        volumeMounts:
+        - {name: inputs, mountPath: /inputs, readOnly: true}
+        - {name: outputs, mountPath: /outputs}
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - name: inputs
+        persistentVolumeClaim: {claimName: lab3-inputs, readOnly: true}
+      - name: outputs
+        persistentVolumeClaim: {claimName: lab3-outputs}
+      - name: tmp
+        emptyDir: {}

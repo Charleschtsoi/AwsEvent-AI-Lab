@@ -1,0 +1,20 @@
+# Lab 3 · steps 14–15 — Sigstore model-validation operator (github.com/sigstore/model-validation-operator).
+# Pods in ai-stack labelled validation.ml.sigstore.dev/ml=qwen3-ft get an injected verifier that checks
+# the OMS signature before the model server starts, and (continuousValidation) re-checks on a schedule.
+apiVersion: ml.sigstore.dev/v1alpha1
+kind: ModelValidation
+metadata:
+  name: qwen3-ft
+  namespace: ai-stack
+spec:
+  config:
+    sigstoreConfig:
+      # identity of the GitHub Actions workflow that signed the model (keyless OIDC)
+      certificateIdentity: "https://github.com/billhoph/AwsEvent-AI-Lab/.github/workflows/secure-model-pipeline.yml@refs/heads/main"
+      certificateOidcIssuer: "https://token.actions.githubusercontent.com"
+  model:
+    path: /models/qwen3-ft
+    signaturePath: /models/qwen3-ft/model.sig
+  continuousValidation:
+    enabled: true
+    interval: "10m"
