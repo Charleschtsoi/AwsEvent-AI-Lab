@@ -1,0 +1,172 @@
+# Secure model pipeline (slides 56–57 / Lab 3): raw data in → signed model out.
+# 8 CI jobs + runtime-protect (in cluster). Every job is a required check; a red ✗ stops the run.
+name: secure-model-pipeline
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["Lab3-SecureTraining/data/**", "Lab3-SecureTraining/scripts/**", "Lab3-SecureTraining/triggers.txt"]
+
+permissions:
+  contents: read
+
+env:
+  BASE_REPO: Qwen/Qwen3-1.7B
+  BASE_REV: ${{ vars.QWEN3_BASE_REV }}     # repo variable: the commit SHA you reviewed on huggingface.co
+  WD: Lab3-SecureTraining
+
+defaults:
+  run:
+    working-directory: Lab3-SecureTraining
+
+jobs:
+  pin-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - name: Require a pinned revision + licence allow-list
+        run: |
+          [ ${#BASE_REV} -eq 40 ] || { echo "BLOCK: set vars.QWEN3_BASE_REV to a 40-char commit SHA"; exit 1; }
+          case "$BASE_REPO" in Qwen/*|meta-llama/*|google/*|microsoft/*) ;; *) echo "BLOCK: publisher not on allow-list"; exit 1;; esac
+          sha256sum data/train.jsonl | tee data.sha256
+
+  scan-dataset:
+    needs: pin-inputs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with: {python-version: "3.12"}
+      - name: Secrets (TruffleHog)
+        uses: trufflesecurity/trufflehog@4dd8831c5f12599465d4d45c3c447b4018a34c85 # v3.97.9
+        with: {path: Lab3-SecureTraining/data}
+        continue-on-error: true   # the lab dataset contains a planted AWS *example* key — remove this line for real data
+      - name: PII (Presidio) + fuzzy scan (MinHash + RapidFuzz)
+        run: |
+          pip install rapidfuzz presidio-analyzer presidio-anonymizer && python -m spacy download en_core_web_lg
+          python scripts/scan_pii.py data/train.jsonl --out data/redacted.jsonl --no-fail
+          python scripts/fuzzy_scan.py data/redacted.jsonl --denylist triggers.txt \
+            --out data/clean.jsonl --quarantine data/quarantine.jsonl || echo "::warning::samples quarantined — see artifact"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with: {name: dataset, path: "Lab3-SecureTraining/data/*.jsonl"}
+
+  scan-model:
+    needs: pin-inputs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with: {python-version: "3.12"}
+      - name: Download pinned base, reject pickle, ModelScan
+        run: |
+          pip install "huggingface_hub>=0.34" modelscan==0.8.5
+          hf download "$BASE_REPO" --revision "$BASE_REV" --local-dir base/
+          if find base/ -type f \( -name '*.bin' -o -name '*.pt' -o -name '*.pkl' -o -name '*.ckpt' \) | grep -q .; then echo "BLOCK: pickle"; exit 1; fi
+          modelscan -p base/
+          sha256sum base/*.safetensors | tee base.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with: {name: base-model, path: Lab3-SecureTraining/base/}
+
+  train-qlora:
+    needs: [scan-dataset, scan-model]
+    runs-on: [self-hosted, gpu, ephemeral]      # ephemeral GPU runner; no egress except to GitHub
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: dataset, path: Lab3-SecureTraining/data}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: base-model, path: Lab3-SecureTraining/base}
+      - name: Unsloth QLoRA (offline)
+        env: {HF_HUB_OFFLINE: "1", HF_DATASETS_OFFLINE: "1"}
+        run: |
+          pip install -r requirements-train.txt
+          python scripts/train.py --base base/ --data data/clean.jsonl --out out/ --gguf
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with: {name: model-out, path: Lab3-SecureTraining/out/}
+
+  scan-output:
+    needs: train-qlora
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: model-out, path: Lab3-SecureTraining/out}
+      - name: safetensors / GGUF only · ModelScan · chat template review
+        run: |
+          pip install modelscan==0.8.5
+          if find out/ -type f \( -name '*.bin' -o -name '*.pt' -o -name '*.pkl' \) | grep -q .; then echo "BLOCK: pickle in outputs"; exit 1; fi
+          modelscan -p out/adapter/
+          grep -h '"chat_template"' out/adapter/*.json | head -c 2000 || true   # review: Jinja SSTI (CVE-2024-34359)
+          sha256sum out/adapter/*.safetensors out/gguf/*.gguf | tee out.sha256
+
+  red-team-eval:
+    needs: train-qlora
+    runs-on: [self-hosted, gpu, ephemeral]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: model-out, path: Lab3-SecureTraining/out}
+      - name: garak + FuzzyAI vs base baseline, trigger probes, task eval
+        run: |
+          pip install garak requests
+          ollama create qwen3-ft -f out/gguf/Modelfile
+          mkdir -p reports
+          garak --model_type ollama --model_name qwen3:0.6b --probes promptinject,dan,leakreplay --report_prefix reports/base
+          garak --model_type ollama --model_name qwen3-ft   --probes promptinject,dan,leakreplay --report_prefix reports/ft
+          python scripts/gate.py --base-report reports/base.report.jsonl --ft-report reports/ft.report.jsonl --model qwen3-ft
+
+  sign-attest:
+    needs: [scan-output, red-team-eval]
+    runs-on: ubuntu-latest
+    permissions: {contents: read, id-token: write}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with: {python-version: "3.12"}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: model-out, path: Lab3-SecureTraining/out}
+      - name: OMS sign (keyless) + AIBOM
+        run: |
+          pip install "model-signing>=1.1" cyclonedx-bom
+          cp out/provenance.json out/gguf/
+          model_signing sign out/gguf --signature out/gguf/model.sig
+          model_signing verify out/gguf --signature out/gguf/model.sig \
+            --identity "https://github.com/${{ github.repository }}/.github/workflows/secure-model-pipeline.yml@${{ github.ref }}" \
+            --identity_provider https://token.actions.githubusercontent.com
+          cyclonedx-py environment -o libs.cdx.json
+          python scripts/make_aibom.py --prov out/provenance.json --base-rev "$BASE_REV" --libs libs.cdx.json --gguf out/gguf -o out/gguf/aibom.cdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with: {name: signed-model, path: Lab3-SecureTraining/out/gguf/}
+
+  publish-admit:
+    needs: sign-attest
+    runs-on: ubuntu-latest
+    environment: production                 # required reviewer = security team
+    permissions: {contents: read, packages: write, id-token: write}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: signed-model, path: model}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with: {registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
+      - name: Push as OCI artifact by digest (ORAS) + cosign
+        working-directory: model
+        run: |
+          # pin ORAS_VERSION + ORAS_SHA256 as repo variables (values from github.com/oras-project/oras/releases)
+          curl -sSLo oras.tgz "https://github.com/oras-project/oras/releases/download/v${{ vars.ORAS_VERSION }}/oras_${{ vars.ORAS_VERSION }}_linux_amd64.tar.gz"
+          echo "${{ vars.ORAS_SHA256 }}  oras.tgz" | sha256sum -c - && tar xzf oras.tgz oras
+          REF=ghcr.io/${{ github.repository_owner }}/models/qwen3-ft
+          ./oras push "$REF:${{ github.sha }}" --export-manifest manifest.json $(ls)
+          DIGEST=sha256:$(sha256sum manifest.json | cut -d' ' -f1)
+          cosign sign --yes "$REF@$DIGEST"
+          echo "model: $REF@$DIGEST → set it in Lab3-SecureTraining/runtime/ollama-deploy.yaml" >> "$GITHUB_STEP_SUMMARY"
+  # runtime-protect (always on, in cluster): AI gateway guardrails & quotas, read-only signed model volume,
+  # gateway-only ingress / zero egress, continuous signature re-validation, Falco model rules, PII redaction,
+  # immutable backups. Manifests: Lab3-SecureTraining/runtime/ + k8s/model-validation.yaml
