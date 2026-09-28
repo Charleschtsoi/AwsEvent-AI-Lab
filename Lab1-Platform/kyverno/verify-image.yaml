@@ -1,0 +1,26 @@
+# Lab 1 · step 5 — only signed images from ttl.sh/* are admitted.
+# helm repo add kyverno https://kyverno.github.io/kyverno/ && helm install kyverno kyverno/kyverno -n kyverno --create-namespace
+# Paste your cosign.pub below, then: kubectl apply -f verify-image.yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images
+spec:
+  validationFailureAction: Enforce
+  webhookTimeoutSeconds: 30
+  rules:
+  - name: require-signature
+    match:
+      any:
+      - resources:
+          kinds: [Pod]
+    verifyImages:
+    - imageReferences: ["ttl.sh/*"]
+      mutateDigest: true
+      attestors:
+      - entries:
+        - keys:
+            publicKeys: |-
+              -----BEGIN PUBLIC KEY-----
+              PASTE_YOUR_COSIGN_PUB_HERE
+              -----END PUBLIC KEY-----

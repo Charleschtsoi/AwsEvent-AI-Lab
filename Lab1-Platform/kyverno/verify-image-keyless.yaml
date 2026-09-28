@@ -1,0 +1,23 @@
+# Production variant — keyless: trust images signed by this repo's GitHub Actions workflow (see .github/workflows/devsecops-app.yml)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images-keyless
+spec:
+  validationFailureAction: Audit      # Crawl/Walk: Audit first, switch to Enforce in the Run phase
+  webhookTimeoutSeconds: 30
+  rules:
+  - name: ghcr-keyless
+    match:
+      any:
+      - resources:
+          kinds: [Pod]
+    verifyImages:
+    - imageReferences: ["ghcr.io/billhoph/*"]
+      mutateDigest: true
+      attestors:
+      - entries:
+        - keyless:
+            subject: "https://github.com/billhoph/AwsEvent-AI-Lab/.github/workflows/devsecops-app.yml@refs/heads/main"
+            issuer: "https://token.actions.githubusercontent.com"
+            rekor: {url: "https://rekor.sigstore.dev"}
