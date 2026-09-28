@@ -1,1 +1,6 @@
-grype file:./requirements.txe
+# SCA: scan the Python dependency manifest for known CVEs
+grype file:./requirements.txt
+
+# SBOM first, then scan the SBOM (fast, repeatable — re-scan daily as new CVEs land)
+syft dir:. -o cyclonedx-json > sbom.cdx.json
+grype sbom:./sbom.cdx.json --only-fixed
