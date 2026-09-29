@@ -44,5 +44,17 @@ spec:
     ports: [{port: 8787, protocol: TCP}]
   - to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
     ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
-# Point Open WebUI at the gateway, not at Ollama:  OLLAMA_BASE_URL=http://portkey-service.ai-stack.svc:8787
-# Note: kind's default CNI (kindnet) does not enforce NetworkPolicy — install Calico or Cilium for this lab.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: model-fetch-egress, namespace: ai-stack}
+spec:
+  podSelector: {matchLabels: {app: model-fetch}}
+  policyTypes: ["Egress"]
+  egress:
+  - ports: [{port: 443, protocol: TCP}]
+  - to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+    ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+# Open WebUI calls portkey-service only. The gateway pod is the only client of ollama-service.
+# model-fetch is the only pod with internet egress, and only while that Job is running.
+# kindnet does not enforce NetworkPolicy — install Calico or Cilium for this lab.

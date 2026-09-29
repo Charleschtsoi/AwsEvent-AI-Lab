@@ -1,33 +1,5 @@
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: ai-stack
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ollama-storage-pvc
-  namespace: ai-stack
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: open-webui-storage-pvc
-  namespace: ai-stack
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 2Gi
----
+# Serving pods. Apply only after job/ollama-model-fetch has completed.
+# Open WebUI has Ollama's native API disabled and calls the gateway service.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -45,32 +17,35 @@ spec:
       labels:
         app: ollama
     spec:
-      # Init container automatically downloads the model into the PV on first boot
-      initContainers:
-        - name: model-puller
-          image: ollama/ollama:latest
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              ollama serve &
-              SERVER_PID=$!
-              until ollama list > /dev/null 2>&1; do
-                echo "Waiting for Ollama server to start..."
-                sleep 2
-              done
-              echo "Pulling qwen3:0.6b model..."
-              ollama pull qwen3:0.6b
-              kill $SERVER_PID
-              wait $SERVER_PID
-          volumeMounts:
-            - name: ollama-storage
-              mountPath: /root/.ollama
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: ollama
-          image: ollama/ollama:latest
+          # ollama/ollama:0.35.0
+          image: ollama/ollama:0.35.0@sha256:2a6e883b917fc543389599dae79918f5cac9e1438890506982f44aa4f5625d01
+          imagePullPolicy: IfNotPresent
+          args: ["serve"]
           ports:
             - containerPort: 11434
               name: api
+          env:
+            - name: OLLAMA_HOST
+              value: 0.0.0.0:11434
+            - name: OLLAMA_MODELS
+              value: /models
+            - name: HOME
+              value: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests:
               cpu: "1"
@@ -79,12 +54,17 @@ spec:
               cpu: "2"
               memory: 4Gi
           volumeMounts:
-            - name: ollama-storage
-              mountPath: /root/.ollama
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
       volumes:
-        - name: ollama-storage
+        - name: models
           persistentVolumeClaim:
-            claimName: ollama-storage-pvc
+            claimName: ollama-models-pvc
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -118,19 +98,49 @@ spec:
       labels:
         app: open-webui
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: open-webui
-          image: ghcr.io/open-webui/open-webui:main
+          # ghcr.io/open-webui/open-webui:v0.11.4
+          image: ghcr.io/open-webui/open-webui:v0.11.4@sha256:9591b13f13843c7721c2b8eaf7382846c81b3ffe126526d1888d1fed50c6a33f
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
               name: http
           env:
-            # Connects Open WebUI to the Ollama internal K8s service
-            - name: OLLAMA_BASE_URL
-              value: "http://ollama-service.ai-stack.svc.cluster.local:11434"
-            # Sets Qwen3 as the interface default
+            - name: ENABLE_OLLAMA_API
+              value: "false"
+            # Skip the image default (/ollama), which probes a local Ollama at startup.
+            - name: OLLAMA_BASE_URLS
+              value: http://127.0.0.1:9
+            - name: ENABLE_OPENAI_API
+              value: "true"
+            - name: OPENAI_API_BASE_URL
+              value: http://portkey-service.ai-stack.svc.cluster.local:8787/v1
+            - name: OPENAI_API_KEY
+              value: lab-local
             - name: DEFAULT_MODELS
-              value: "qwen3:0.6b"
+              value: qwen3:0.6b
+            - name: WEBUI_SECRET_KEY_FILE
+              value: /app/backend/data/.webui_secret_key
+            - name: HOME
+              value: /tmp
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests:
               cpu: "500m"
@@ -141,10 +151,14 @@ spec:
           volumeMounts:
             - name: webui-storage
               mountPath: /app/backend/data
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: webui-storage
           persistentVolumeClaim:
             claimName: open-webui-storage-pvc
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -152,11 +166,10 @@ metadata:
   name: open-webui-service
   namespace: ai-stack
 spec:
-  type: NodePort
+  type: ClusterIP
   ports:
     - port: 80
       targetPort: 8080
-      nodePort: 30080
       protocol: TCP
       name: http
   selector:

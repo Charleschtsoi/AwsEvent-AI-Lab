@@ -6,6 +6,21 @@
 
 This lab goes with the talk *AI on Kubernetes: supply chain security & defense-in-depth for cloud-native AI*. It has **3 labs and 15 hands-on steps**. You start with a cluster, add a guarded LLM, and finish with a securely fine-tuned model that is signed, verified and protected at runtime.
 
+## What this fork changes
+
+Step 10 used to apply a demo that skipped the control this lab is about. Open WebUI called Ollama directly, the images floated on `:latest` and `:main`, and an init container ran `ollama pull` inside the serving pod.
+
+The manifests under `AIApp/` now match the architecture below:
+
+1. **Fetch once.** `model-fetch-job.yaml` pulls `qwen3:0.6b` into a volume. That Job is the only pod in `ai-stack` allowed to reach the public internet.
+2. **Serve from that volume.** The Ollama pod mounts the volume read-only and has no egress, so it cannot pull or swap a model later.
+3. **One path to the model.** Open WebUI has Ollama's native API turned off. It calls `portkey-service` only. The gateway pod is the only client of `ollama-service`.
+4. **Why there is an nginx in the gateway pod.** Open WebUI speaks the OpenAI API and does not send Portkey routing headers. nginx adds `x-portkey-provider: ollama` and `x-portkey-custom-host` and forwards chat to Portkey on localhost. This Portkey build does not proxy `GET /v1/models`, so that single request is answered from Ollama by the same pod. The UI still never dials Ollama itself.
+5. **Images are pinned by digest.** Ollama `0.35.0`, Open WebUI `v0.11.4`, Portkey gateway `1.15.2`, nginx-unprivileged `1.30.5-alpine`.
+6. **Pod Security `restricted`.** The namespace enforces non-root, `RuntimeDefault` seccomp, and dropping all capabilities. The UI Service is ClusterIP, so it is reached with `kubectl port-forward` rather than a NodePort.
+
+kind's default CNI still does not enforce NetworkPolicy. Install Calico or Cilium when you want the policy to actually block a direct call to Ollama.
+
 | Deck section | Covered in this repo |
 | --- | --- |
 | 01 Why AI on Kubernetes | Reference architecture (below) |
@@ -38,7 +53,7 @@ brew install kind kubectl helm checkov syft grype cosign trufflehog
   devsecops-app.yml          # slides 34–35: app DevSecOps as a workflow (7 required jobs)
   secure-model-pipeline.yml  # slides 56–57: model pipeline as a workflow (8 jobs + runtime)
 Lab1-Platform/kyverno/       # step 5: verify-image policies (key-based + keyless)
-AIApp/                       # step 10: Open WebUI + Ollama, Portkey AI gateway
+AIApp/                       # step 10: Open WebUI → Portkey → Ollama, images pinned by digest
 ModelScan/                   # step 7: benign vs trojanized Keras models
 LLMRedteam/                  # step 8: garak notes
 SASTTest/  SCATest/          # SAST (Bandit/Semgrep) and SCA (Grype/Syft) samples
@@ -162,15 +177,22 @@ fuzzyai fuzz -m ollama/qwen3:0.6b -a def -a dan -a art -t "<test prompt>"
 ```
 `jailbreak? = True` means a guardrail gap. Use a harmful-behaviour test set, not ad-hoc prompts.
 
-### Step 10 · Deploy the AI app, then add a gateway
+### Step 10 · Deploy the guarded AI app
+
+The model volume is `ReadWriteOnce`, so the fetch Job has to finish and release it before the serving pod starts. Apply the network policy in the same first step, or the Job has no DNS or HTTPS egress.
+
 ```bash
-kubectl apply -f AIApp/ai-app.yaml
+kubectl apply -f AIApp/namespace.yaml \
+  -f Lab3-SecureTraining/runtime/networkpolicy-ai-stack.yaml \
+  -f AIApp/model-fetch-job.yaml
+kubectl wait --for=condition=complete job/ollama-model-fetch -n ai-stack --timeout=20m
+kubectl apply -f AIApp/ai-app.yaml -f AIApp/portkey.yaml
 kubectl port-forward svc/open-webui-service -n ai-stack 8080:80
-kubectl apply -f AIApp/portkey.yaml
-kubectl port-forward svc/portkey-service -n ai-stack 8090:8787
-kubectl apply -f Lab3-SecureTraining/runtime/networkpolicy-ai-stack.yaml   # only gateway → Ollama
 ```
-The app calls the gateway, never the model directly. Re-run garak and FuzzyAI **through the gateway** and compare. Pin the gateway image by digest: AI gateways are high-value targets (LiteLLM, March 2026).
+
+Open http://localhost:8080 and chat with `qwen3:0.6b`. The browser talks to Open WebUI, Open WebUI talks to the gateway, and only the gateway talks to Ollama. Re-run garak and FuzzyAI against the gateway (`port-forward` of `portkey-service` on 8787) and compare with the Lab 2 baseline.
+
+If this namespace already has the old `ollama-storage-pvc` from the previous manifest, leave it. The serving pod uses a new claim, `ollama-models-pvc`.
 
 ---
 

@@ -1,3 +1,43 @@
+# Gateway pod: nginx accepts the OpenAI-compatible calls from Open WebUI and
+# adds the headers the open-source Portkey gateway needs. Portkey then calls Ollama.
+# GET /v1/models is served from Ollama by this same pod, because this Portkey
+# build does not proxy that route.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portkey-nginx
+  namespace: ai-stack
+data:
+  nginx.conf: |
+    worker_processes 1;
+    error_log /tmp/error.log warn;
+    pid /tmp/nginx.pid;
+    events { worker_connections 128; }
+    http {
+      client_body_temp_path /tmp/client_temp;
+      proxy_temp_path /tmp/proxy_temp;
+      fastcgi_temp_path /tmp/fastcgi_temp;
+      uwsgi_temp_path /tmp/uwsgi_temp;
+      scgi_temp_path /tmp/scgi_temp;
+      access_log off;
+      client_max_body_size 20m;
+      server {
+        listen 8787;
+        location = /v1/models {
+          proxy_pass http://ollama-service.ai-stack.svc.cluster.local:11434/v1/models;
+          proxy_http_version 1.1;
+          proxy_set_header Host $host;
+        }
+        location / {
+          proxy_pass http://127.0.0.1:8788;
+          proxy_http_version 1.1;
+          proxy_buffering off;
+          proxy_set_header Host $host;
+          proxy_set_header x-portkey-provider ollama;
+          proxy_set_header x-portkey-custom-host http://ollama-service.ai-stack.svc.cluster.local:11434;
+        }
+      }
+    }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -16,26 +56,77 @@ spec:
       labels:
         app: portkey-gateway
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: gateway
-          image: portkeyai/gateway:latest
+          # portkeyai/gateway:1.15.2
+          image: portkeyai/gateway:1.15.2@sha256:97f094d9c8a764cbfaa2a7138c0017b247ca923bb06db1b4c13b7f8a33b5200d
+          imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 8787
-              name: proxy
+            - containerPort: 8788
+              name: gateway
+          env:
+            - name: PORT
+              value: "8788"
+            - name: TELEMETRY
+              value: "false"
+            - name: HOME
+              value: /tmp
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests:
               cpu: "250m"
-              memory: 512Mi
+              memory: 256Mi
             limits:
               cpu: "500m"
-              memory: 1Gi
-          # Portkey configurations can be adjusted via environment variables
-          env:
-            - name: PORT
-              value: "8787"
-            # Disable cloud metrics syncing for a strictly offline local cluster
-            - name: TELEMETRY
-              value: "false"
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+        - name: header-proxy
+          # nginxinc/nginx-unprivileged:1.30.5-alpine
+          image: nginxinc/nginx-unprivileged:1.30.5-alpine@sha256:ed04ec1ff34502c339ee5c3ae3f855442398edc1d05591e2b98981dcbbd20b1e
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8787
+              name: proxy
+          securityContext:
+            runAsUser: 101
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "50m"
+              memory: 64Mi
+            limits:
+              cpu: "200m"
+              memory: 128Mi
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: portkey-nginx
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

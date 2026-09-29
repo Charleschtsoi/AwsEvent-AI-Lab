@@ -1,0 +1,55 @@
+# One-shot pull of the lab model. This is the only AI-stack pod allowed to reach the internet.
+# Wait for it to complete before applying ai-app.yaml — the models volume is ReadWriteOnce.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ollama-model-fetch
+  namespace: ai-stack
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: model-fetch
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: fetch
+          # ollama/ollama:0.35.0
+          image: ollama/ollama:0.35.0@sha256:2a6e883b917fc543389599dae79918f5cac9e1438890506982f44aa4f5625d01
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              ollama pull qwen3:0.6b
+              touch /models/.ready
+          env:
+            - name: OLLAMA_MODELS
+              value: /models
+            - name: HOME
+              value: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ollama-models-pvc
+        - name: tmp
+          emptyDir: {}
